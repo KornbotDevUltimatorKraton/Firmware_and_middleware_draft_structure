@@ -2,7 +2,7 @@
 #include <STM32FreeRTOS.h>
 #include <Arduino_JSON.h> // Switched library
 #include <SoftwareSerial.h>
-
+//This firmware is prototype based on the Serial control digital and analog read over the JSON structure payload 
 SoftwareSerial mySerial(10, 9); // RX, TX
 // Semaphores and Queues
 SemaphoreHandle_t xSerialMutex;
