@@ -2,7 +2,7 @@
 #include <STM32FreeRTOS.h>
 #include <Arduino_JSON.h> // Switched library
 #include <SoftwareSerial.h>
-//This firmware is prototype based on the Serial control digital and analog read over the JSON structure payload 
+
 SoftwareSerial mySerial(10, 9); // RX, TX
 // Semaphores and Queues
 SemaphoreHandle_t xSerialMutex;
@@ -36,9 +36,10 @@ void setup() {
    
     if (xSerialMutex != NULL && xSensorQueue != NULL) {
         // Create Tasks
-        xTaskCreate(vTaskSerialRX, "Serial_RX", 512, NULL, 2, NULL);
-        xTaskCreate(vTaskAnalogRead, "Analog_Read", 256, NULL, 3, NULL);
-        xTaskCreate(vTaskSerialTX, "Serial_TX", 512, NULL, 1, NULL);
+       // In setup():
+       xTaskCreate(vTaskSerialRX, "Serial_RX", 512, NULL, 4, NULL); // Priority 4
+       xTaskCreate(vTaskAnalogRead, "Analog_Read", 256, NULL, 3, NULL);
+       xTaskCreate(vTaskSerialTX, "Serial_TX", 512, NULL, 1, NULL); // Priority 1
 
         vTaskStartScheduler();
     }
@@ -51,29 +52,39 @@ void loop() {
 // 1. Serial RX Task: Parses incoming JSON commands using Arduino_JSON
 void vTaskSerialRX(void *pvParameters) {
     String inputString = "";
+    inputString.reserve(64); // Keep this to prevent heap fragmentation
 
     for (;;) {
-        while (mySerial.available() > 0) {
-            char inChar = (char) mySerial.read();
-            if (inChar == '\n') {
-                // Parse the incoming JSON string
-                JSONVar myObject = JSON.parse(inputString);
-
-                // Check if parsing succeeded
-                if (JSON.typeof(myObject) != "undefined") {
-                    // Check if key exists
-                    if (myObject.hasOwnProperty("led")) {
-                        // Cast JSONVar value to boolean explicitly
-                        bool ledState = (bool)myObject["led"];
-                        digitalWrite(CONTROL_LED, ledState ? HIGH : LOW);
+        // Only attempt to read if serial data is waiting
+        if (mySerial.available() > 0) {
+            // Take mutex for the duration of the read process
+            if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                
+                while (mySerial.available() > 0) {
+                    char inChar = (char)mySerial.read();
+                    
+                    if (inChar == '\n') {
+                        // Safety: Only parse if the string isn't empty
+                        if (inputString.length() > 0) {
+                            JSONVar myObject = JSON.parse(inputString);
+                            
+                            // Check for validity AND existence of the "led" key
+                            if (JSON.typeof(myObject) != "undefined" && myObject.hasOwnProperty("led")) {
+                                // Apply Active-Low logic (PH7: LOW=ON, HIGH=OFF)
+                                bool targetState = (bool)myObject["led"];
+                                digitalWrite(CONTROL_LED, targetState ? LOW : HIGH);
+                            }
+                        }
+                        inputString = ""; // Reset buffer after processing
+                    } else if (inChar != '\r') {
+                        inputString += inChar; // Build command string
                     }
                 }
-                inputString = ""; // Clear string for next command
-            } else {
-                inputString += inChar;
+                xSemaphoreGive(xSerialMutex);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10)); // Yield to allow other tasks to run
+        // Yield to let other FreeRTOS tasks (TX/Analog) execute
+        vTaskDelay(pdMS_TO_TICKS(5)); 
     }
 }
 
