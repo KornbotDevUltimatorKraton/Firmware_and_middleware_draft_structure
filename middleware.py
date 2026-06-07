@@ -94,6 +94,12 @@ class RobotHardwareBridge:
             "mode": mode, 
             "value": value
         })
+    def set_uart_config(self, mcu_name: str, baud: int):
+        self._send_command(mcu_name, {"cmd": "init_uart", "baud": baud})
+
+    def uart_write(self, mcu_name: str, data: str):
+        self._send_command(mcu_name, {"cmd": "uart_write", "data": data})
+
     def set_native_servo(self, mcu_name, pin, angle):
         self._send_command(mcu_name, {"cmd": "set_servo", "pin": pin, "value": angle})
 
@@ -140,7 +146,12 @@ async def motor_neuron(request: Request):
         # Keep existing legacy support if needed
         elif 'gpio' in msg:
             executor.submit(robot_bridge.set_gpio, mcu_name, msg['gpio'].get('state', False))
-        
+        if 'cmd' in msg and msg['cmd'] == 'init_uart':
+            executor.submit(robot_bridge.set_uart_config, mcu_name, msg.get('baud', 115200))
+
+        elif 'cmd' in msg and msg['cmd'] == 'uart_write':
+            executor.submit(robot_bridge.uart_write, mcu_name, msg.get('data', ''))
+            
         return {'status': 'Command submitted.'}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
