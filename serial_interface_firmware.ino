@@ -1,128 +1,134 @@
 #include <Arduino.h>
 #include <STM32FreeRTOS.h>
-#include <Arduino_JSON.h> // Switched library
+#include <Arduino_JSON.h>
 #include <SoftwareSerial.h>
+#include <Wire.h>
 
-SoftwareSerial mySerial(10, 9); // RX, TX
-// Semaphores and Queues
+SoftwareSerial mySerial(10, 9);
 SemaphoreHandle_t xSerialMutex;
 QueueHandle_t xSensorQueue;
 
-// Struct for sensor data
 struct SensorData {
     int analogVal1;
     int analogVal2;
+    float i2cVal;
 };
 
-// Pin definitions
-const int ANALOG_PIN_1 = PA0;
-const int ANALOG_PIN_2 = PA1;
-const int CONTROL_LED = PH7;
+// Map names to pins
+uint32_t getPinFromName(String name) {
+    if (name == "PA0") return PA0;
+    if (name == "PA1") return PA1;
+    if (name == "PB8") return PB8;
+    if (name == "PH7") return PH7;
+    if (name == "PA9") return PA9;   // TX1
+    if (name == "PA10") return PA10; // RX1
+    return 0xFFFFFFFF; 
+}
+
+// Global UART pointer
+HardwareSerial* dynamicSerial = nullptr;
 
 // Task Prototypes
 void vTaskSerialRX(void *pvParameters);
 void vTaskAnalogRead(void *pvParameters);
+void vTaskI2CRead(void *pvParameters);
 void vTaskSerialTX(void *pvParameters);
+void vTaskUARTRead(void *pvParameters);
 
 void setup() {
-    //Serial.begin(115200);
     mySerial.begin(115200);
-    pinMode(CONTROL_LED, OUTPUT);
-    pinMode(ANALOG_PIN_1, INPUT_ANALOG);
-    pinMode(ANALOG_PIN_2, INPUT_ANALOG);
-    // Create Mutex and Queue
+    Wire.begin();
     xSerialMutex = xSemaphoreCreateMutex();
     xSensorQueue = xQueueCreate(5, sizeof(SensorData));
-   
-    if (xSerialMutex != NULL && xSensorQueue != NULL) {
-        // Create Tasks
-       // In setup():
-       xTaskCreate(vTaskSerialRX, "Serial_RX", 512, NULL, 4, NULL); // Priority 4
-       xTaskCreate(vTaskAnalogRead, "Analog_Read", 256, NULL, 3, NULL);
-       xTaskCreate(vTaskSerialTX, "Serial_TX", 512, NULL, 1, NULL); // Priority 1
-
-        vTaskStartScheduler();
-    }
+    
+    xTaskCreate(vTaskSerialRX, "Serial_RX", 1024, NULL, 4, NULL);
+    xTaskCreate(vTaskAnalogRead, "Analog_Read", 256, NULL, 3, NULL);
+    xTaskCreate(vTaskI2CRead, "I2C_Read", 256, NULL, 3, NULL);
+    xTaskCreate(vTaskSerialTX, "Serial_TX", 512, NULL, 1, NULL);
+    xTaskCreate(vTaskUARTRead, "UART_Read", 512, NULL, 2, NULL); // Critical for UART telemetry
+    
+    vTaskStartScheduler();
 }
 
-void loop() {
-    // Empty when using FreeRTOS
-}
+void loop() {}
 
-// 1. Serial RX Task: Parses incoming JSON commands using Arduino_JSON
+// 1. Serial RX Task
 void vTaskSerialRX(void *pvParameters) {
     String inputString = "";
-    inputString.reserve(64); // Keep this to prevent heap fragmentation
-
     for (;;) {
-        // Only attempt to read if serial data is waiting
         if (mySerial.available() > 0) {
-            // Take mutex for the duration of the read process
-            if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                
-                while (mySerial.available() > 0) {
-                    char inChar = (char)mySerial.read();
+            char inChar = (char)mySerial.read();
+            if (inChar == '\n') {
+                JSONVar myObject = JSON.parse(inputString);
+                if (JSON.typeof(myObject) != "undefined" && myObject.hasOwnProperty("cmd")) {
+                    String cmd = (String)myObject["cmd"];
                     
-                    if (inChar == '\n') {
-                        // Safety: Only parse if the string isn't empty
-                        if (inputString.length() > 0) {
-                            JSONVar myObject = JSON.parse(inputString);
-                            
-                            // Check for validity AND existence of the "led" key
-                            if (JSON.typeof(myObject) != "undefined" && myObject.hasOwnProperty("led")) {
-                                // Apply Active-Low logic (PH7: LOW=ON, HIGH=OFF)
-                                bool targetState = (bool)myObject["led"];
-                                digitalWrite(CONTROL_LED, targetState ? LOW : HIGH);
-                            }
+                    if (cmd == "set_pin") {
+                        uint32_t pin = getPinFromName((String)myObject["pin"]);
+                        String mode = (String)myObject["mode"];
+                        int val = (int)myObject["value"];
+                        if (pin != 0xFFFFFFFF) {
+                            if (mode == "gpio") { pinMode(pin, OUTPUT); digitalWrite(pin, val ? HIGH : LOW); }
+                            else if (mode == "pwm") { pinMode(pin, OUTPUT); analogWrite(pin, val); }
                         }
-                        inputString = ""; // Reset buffer after processing
-                    } else if (inChar != '\r') {
-                        inputString += inChar; // Build command string
+                    } 
+                    else if (cmd == "init_uart") {
+                        long baud = (long)myObject["baud"];
+                        if (dynamicSerial) delete dynamicSerial;
+                        dynamicSerial = new HardwareSerial(PA10, PA9);
+                        dynamicSerial->begin(baud);
+                    }
+                    else if (cmd == "uart_write" && dynamicSerial) {
+                        dynamicSerial->print((String)myObject["data"]);
                     }
                 }
-                xSemaphoreGive(xSerialMutex);
-            }
+                inputString = "";
+            } else if (inChar != '\r') { inputString += inChar; }
         }
-        // Yield to let other FreeRTOS tasks (TX/Analog) execute
-        vTaskDelay(pdMS_TO_TICKS(5)); 
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
-// 2. Analog Read Task: High priority deterministic sampling
+// 2. UART Read Task
+void vTaskUARTRead(void *pvParameters) {
+    SensorData d;
+    for (;;) {
+        if (dynamicSerial && dynamicSerial->available() > 0) {
+            String incoming = dynamicSerial->readStringUntil('\n');
+            d.analogVal1 = incoming.toInt();
+            d.analogVal2 = 0;
+            d.i2cVal = 0.0;
+            xQueueSend(xSensorQueue, &d, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// 3. Analog Read Task
 void vTaskAnalogRead(void *pvParameters) {
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // Sample every 50ms (20Hz)
-    SensorData currentData;
-
+    SensorData d;
     for (;;) {
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-
-        currentData.analogVal1 = analogRead(ANALOG_PIN_1);
-        currentData.analogVal2 = analogRead(ANALOG_PIN_2);
-
-        // Send to queue, overwrite if full to prioritize fresh metrics
-        xQueueSend(xSensorQueue, &currentData, 0);
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(50));
+        d.analogVal1 = analogRead(PA0);
+        d.analogVal2 = analogRead(PA1);
+        xQueueSend(xSensorQueue, &d, 0);
     }
 }
 
-// 3. Serial TX Task: Serializes telemetry using Arduino_JSON and streams to Python
-// 3. Serial TX Task: Serializes telemetry using Arduino_JSON and streams to Python
-// 3. Serial TX Task: Manually formatted JSON telemetry
+// 4. I2C Read Task
+void vTaskI2CRead(void *pvParameters) {
+    for (;;) { vTaskDelay(pdMS_TO_TICKS(100)); }
+}
+
+// 5. Serial TX Task
 void vTaskSerialTX(void *pvParameters) {
-    SensorData txData;
-
+    SensorData d;
     for (;;) {
-        // Block until data is available in the queue
-        if (xQueueReceive(xSensorQueue, &txData, portMAX_DELAY) == pdPASS) {
-            
-            // Manually build the JSON string to ensure stability and performance
-            // Format: {"s1":123,"s2":456}
-            String jsonString = "{\"s1\":" + String(txData.analogVal1) + 
-                                ",\"s2\":" + String(txData.analogVal2) + "}";
-
-            // Take mutex before writing to shared Serial resource
+        if (xQueueReceive(xSensorQueue, &d, portMAX_DELAY) == pdPASS) {
+            String s = "{\"s1\":" + String(d.analogVal1) + ",\"s2\":" + String(d.analogVal2) + ",\"i2c\":" + String(d.i2cVal) + "}";
             if (xSemaphoreTake(xSerialMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                mySerial.println(jsonString); // Sends the single JSON line
+                mySerial.println(s);
                 xSemaphoreGive(xSerialMutex);
             }
         }
